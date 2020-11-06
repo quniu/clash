@@ -62,12 +62,14 @@ type DNS struct {
 	EnhancedMode      dns.EnhancedMode `yaml:"enhanced-mode"`
 	DefaultNameserver []dns.NameServer `yaml:"default-nameserver"`
 	FakeIPRange       *fakeip.Pool
+	Hosts             *trie.DomainTrie
 }
 
 // FallbackFilter config
 type FallbackFilter struct {
 	GeoIP  bool         `yaml:"geoip"`
 	IPCIDR []*net.IPNet `yaml:"ipcidr"`
+	Domain []string     `yaml:"domain"`
 }
 
 // Experimental config
@@ -88,6 +90,7 @@ type Config struct {
 type RawDNS struct {
 	Enable            bool              `yaml:"enable"`
 	IPv6              bool              `yaml:"ipv6"`
+	UseHosts          bool              `yaml:"use-hosts"`
 	NameServer        []string          `yaml:"nameserver"`
 	Fallback          []string          `yaml:"fallback"`
 	FallbackFilter    RawFallbackFilter `yaml:"fallback-filter"`
@@ -101,6 +104,7 @@ type RawDNS struct {
 type RawFallbackFilter struct {
 	GeoIP  bool     `yaml:"geoip"`
 	IPCIDR []string `yaml:"ipcidr"`
+	Domain []string `yaml:"domain"`
 }
 
 type RawConfig struct {
@@ -152,6 +156,7 @@ func UnmarshalRawConfig(buf []byte) (*RawConfig, error) {
 		ProxyGroup:     []map[string]interface{}{},
 		DNS: RawDNS{
 			Enable:      false,
+			UseHosts:    true,
 			FakeIPRange: "198.18.0.1/16",
 			FallbackFilter: RawFallbackFilter{
 				GeoIP:  true,
@@ -195,17 +200,17 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 	}
 	config.Rules = rules
 
-	dnsCfg, err := parseDNS(rawCfg.DNS)
-	if err != nil {
-		return nil, err
-	}
-	config.DNS = dnsCfg
-
 	hosts, err := parseHosts(rawCfg)
 	if err != nil {
 		return nil, err
 	}
 	config.Hosts = hosts
+
+	dnsCfg, err := parseDNS(rawCfg.DNS, hosts)
+	if err != nil {
+		return nil, err
+	}
+	config.DNS = dnsCfg
 
 	config.Users = parseAuthentication(rawCfg.Authentication)
 
@@ -261,11 +266,11 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 	for idx, mapping := range proxiesConfig {
 		proxy, err := outbound.ParseProxy(mapping)
 		if err != nil {
-			return nil, nil, fmt.Errorf("Proxy %d: %w", idx, err)
+			return nil, nil, fmt.Errorf("proxy %d: %w", idx, err)
 		}
 
 		if _, exist := proxies[proxy.Name()]; exist {
-			return nil, nil, fmt.Errorf("Proxy %s is the duplicate name", proxy.Name())
+			return nil, nil, fmt.Errorf("proxy %s is the duplicate name", proxy.Name())
 		}
 		proxies[proxy.Name()] = proxy
 		proxyList = append(proxyList, proxy.Name())
@@ -275,7 +280,7 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 	for idx, mapping := range groupsConfig {
 		groupName, existName := mapping["name"].(string)
 		if !existName {
-			return nil, nil, fmt.Errorf("ProxyGroup %d: missing name", idx)
+			return nil, nil, fmt.Errorf("proxy group %d: missing name", idx)
 		}
 		proxyList = append(proxyList, groupName)
 	}
@@ -310,12 +315,12 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 	for idx, mapping := range groupsConfig {
 		group, err := outboundgroup.ParseProxyGroup(mapping, proxies, providersMap)
 		if err != nil {
-			return nil, nil, fmt.Errorf("ProxyGroup[%d]: %w", idx, err)
+			return nil, nil, fmt.Errorf("proxy group[%d]: %w", idx, err)
 		}
 
 		groupName := group.Name()
 		if _, exist := proxies[groupName]; exist {
-			return nil, nil, fmt.Errorf("ProxyGroup %s: the duplicate name", groupName)
+			return nil, nil, fmt.Errorf("proxy group %s: the duplicate name", groupName)
 		}
 
 		proxies[groupName] = outbound.NewProxy(group)
@@ -370,11 +375,11 @@ func parseRules(cfg *RawConfig, proxies map[string]C.Proxy) ([]C.Rule, error) {
 			target = rule[2]
 			params = rule[3:]
 		default:
-			return nil, fmt.Errorf("Rules[%d] [%s] error: format invalid", idx, line)
+			return nil, fmt.Errorf("rules[%d] [%s] error: format invalid", idx, line)
 		}
 
 		if _, ok := proxies[target]; !ok {
-			return nil, fmt.Errorf("Rules[%d] [%s] error: proxy [%s] not found", idx, line, target)
+			return nil, fmt.Errorf("rules[%d] [%s] error: proxy [%s] not found", idx, line, target)
 		}
 
 		rule = trimArr(rule)
@@ -382,7 +387,11 @@ func parseRules(cfg *RawConfig, proxies map[string]C.Proxy) ([]C.Rule, error) {
 
 		parsed, parseErr := R.ParseRule(rule[0], payload, target, params)
 		if parseErr != nil {
-			return nil, fmt.Errorf("Rules[%d] [%s] error: %s", idx, line, parseErr.Error())
+			if parseErr == R.ErrPlatformNotSupport {
+				log.Warnln("Rules[%d] [%s] don't support current OS, skip", idx, line)
+				continue
+			}
+			return nil, fmt.Errorf("rules[%d] [%s] error: %s", idx, line, parseErr.Error())
 		}
 
 		rules = append(rules, parsed)
@@ -396,7 +405,7 @@ func parseHosts(cfg *RawConfig) (*trie.DomainTrie, error) {
 
 	// add default hosts
 	if err := tree.Insert("localhost", net.IP{127, 0, 0, 1}); err != nil {
-		println(err.Error())
+		log.Errorln("insert localhost to host error: %s", err.Error())
 	}
 
 	if len(cfg.Hosts) != 0 {
@@ -490,9 +499,9 @@ func parseFallbackIPCIDR(ips []string) ([]*net.IPNet, error) {
 	return ipNets, nil
 }
 
-func parseDNS(cfg RawDNS) (*DNS, error) {
+func parseDNS(cfg RawDNS, hosts *trie.DomainTrie) (*DNS, error) {
 	if cfg.Enable && len(cfg.NameServer) == 0 {
-		return nil, fmt.Errorf("If DNS configuration is turned on, NameServer cannot be empty")
+		return nil, fmt.Errorf("if DNS configuration is turned on, NameServer cannot be empty")
 	}
 
 	dnsCfg := &DNS{
@@ -553,6 +562,11 @@ func parseDNS(cfg RawDNS) (*DNS, error) {
 	dnsCfg.FallbackFilter.GeoIP = cfg.FallbackFilter.GeoIP
 	if fallbackip, err := parseFallbackIPCIDR(cfg.FallbackFilter.IPCIDR); err == nil {
 		dnsCfg.FallbackFilter.IPCIDR = fallbackip
+	}
+	dnsCfg.FallbackFilter.Domain = cfg.FallbackFilter.Domain
+
+	if cfg.UseHosts {
+		dnsCfg.Hosts = hosts
 	}
 
 	return dnsCfg, nil
